@@ -1,0 +1,225 @@
+name: Build APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch: {}
+
+concurrency:
+  group: build-apk
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Prepare web assets
+        run: |
+          mkdir -p www
+          find . -maxdepth 1 ! -name '.' ! -name '.git' ! -name '.github' ! -name 'www' ! -name '.moon-icons' ! -name 'node_modules' -exec cp -r {} www/ \;
+
+      - name: Init npm project
+        run: npm init -y
+
+      - name: Install Capacitor
+        run: npm install @capacitor/core @capacitor/android @capacitor/cli @capacitor/filesystem @capacitor/share
+
+      - name: Init Capacitor
+        run: |
+          npx cap init "moontoolkit" "com.moondevelopers.moontoolkit" --web-dir=www
+
+      - name: Add Android platform
+        run: npx cap add android
+
+      - name: Add Moon Saver (direct save to Downloads)
+        run: |
+          set -e
+          JAVA_DIR=android/app/src/main/java/com/moondevelopers/moontoolkit
+          mkdir -p "$JAVA_DIR"
+          find android/app/src/main -name "MainActivity.*" -delete
+          cat > "$JAVA_DIR/MoonSaverPlugin.java" <<'MOON_JAVA'
+          package com.moondevelopers.moontoolkit;
+          
+          import android.content.ContentResolver;
+          import android.content.ContentValues;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Environment;
+          import android.provider.MediaStore;
+          import android.util.Base64;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+          import java.io.OutputStream;
+          import java.util.Map;
+          import java.util.UUID;
+          import java.util.concurrent.ConcurrentHashMap;
+          
+          @CapacitorPlugin(name = "MoonSaver")
+          public class MoonSaverPlugin extends Plugin {
+              private final Map<String, OutputStream> streams = new ConcurrentHashMap<>();
+              private final Map<String, Uri> uris = new ConcurrentHashMap<>();
+          
+              @PluginMethod
+              public void open(PluginCall call) {
+                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                      call.reject("UNSUPPORTED_SDK");
+                      return;
+                  }
+                  try {
+                      String name = call.getString("name", "file");
+                      String mime = call.getString("mime", "application/octet-stream");
+                      ContentResolver resolver = getContext().getContentResolver();
+                      ContentValues values = new ContentValues();
+                      values.put(MediaStore.MediaColumns.DISPLAY_NAME, name);
+                      values.put(MediaStore.MediaColumns.MIME_TYPE, mime);
+                      values.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+                      values.put(MediaStore.MediaColumns.IS_PENDING, 1);
+                      Uri uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+                      if (uri == null) {
+                          call.reject("Could not create the file in Downloads");
+                          return;
+                      }
+                      OutputStream os = resolver.openOutputStream(uri);
+                      if (os == null) {
+                          call.reject("Could not open the file for writing");
+                          return;
+                      }
+                      String id = UUID.randomUUID().toString();
+                      streams.put(id, os);
+                      uris.put(id, uri);
+                      JSObject res = new JSObject();
+                      res.put("id", id);
+                      call.resolve(res);
+                  } catch (Exception e) {
+                      call.reject(String.valueOf(e.getMessage()));
+                  }
+              }
+          
+              @PluginMethod
+              public void write(PluginCall call) {
+                  String id = call.getString("id");
+                  String data = call.getString("data");
+                  OutputStream os = id == null ? null : streams.get(id);
+                  if (os == null || data == null) {
+                      call.reject("Unknown file id");
+                      return;
+                  }
+                  try {
+                      os.write(Base64.decode(data, Base64.DEFAULT));
+                      call.resolve();
+                  } catch (Exception e) {
+                      call.reject(String.valueOf(e.getMessage()));
+                  }
+              }
+          
+              @PluginMethod
+              public void close(PluginCall call) {
+                  String id = call.getString("id");
+                  OutputStream os = id == null ? null : streams.remove(id);
+                  Uri uri = id == null ? null : uris.remove(id);
+                  if (os == null || uri == null) {
+                      call.reject("Unknown file id");
+                      return;
+                  }
+                  try {
+                      os.flush();
+                      os.close();
+                      ContentValues values = new ContentValues();
+                      values.put(MediaStore.MediaColumns.IS_PENDING, 0);
+                      getContext().getContentResolver().update(uri, values, null, null);
+                      JSObject res = new JSObject();
+                      res.put("uri", uri.toString());
+                      call.resolve(res);
+                  } catch (Exception e) {
+                      call.reject(String.valueOf(e.getMessage()));
+                  }
+              }
+          
+              @PluginMethod
+              public void abort(PluginCall call) {
+                  String id = call.getString("id");
+                  OutputStream os = id == null ? null : streams.remove(id);
+                  Uri uri = id == null ? null : uris.remove(id);
+                  try {
+                      if (os != null) {
+                          os.close();
+                      }
+                      if (uri != null) {
+                          getContext().getContentResolver().delete(uri, null, null);
+                      }
+                  } catch (Exception e) {
+                      // ignore
+                  }
+                  call.resolve();
+              }
+          }
+          MOON_JAVA
+          cat > "$JAVA_DIR/MainActivity.java" <<'MOON_JAVA'
+          package com.moondevelopers.moontoolkit;
+          
+          import android.os.Bundle;
+          import com.getcapacitor.BridgeActivity;
+          
+          public class MainActivity extends BridgeActivity {
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  registerPlugin(MoonSaverPlugin.class);
+                  super.onCreate(savedInstanceState);
+              }
+          }
+          MOON_JAVA
+
+      - name: Apply app icon
+        run: |
+          for d in .moon-icons/mipmap-*; do
+            n=$(basename "$d")
+            mkdir -p "android/app/src/main/res/$n"
+            cp "$d"/*.png "android/app/src/main/res/$n/"
+          done
+
+      - name: Sync web assets
+        run: npx cap sync android
+
+      - name: Fix duplicate Kotlin stdlib classes
+        run: |
+          echo 'configurations.all {' >> android/app/build.gradle
+          echo '    exclude group: "org.jetbrains.kotlin", module: "kotlin-stdlib-jdk7"' >> android/app/build.gradle
+          echo '    exclude group: "org.jetbrains.kotlin", module: "kotlin-stdlib-jdk8"' >> android/app/build.gradle
+          echo '}' >> android/app/build.gradle
+
+      - name: Accept Android SDK licenses
+        run: yes | sdkmanager --licenses || true
+
+      - name: Build debug APK
+        working-directory: android
+        run: chmod +x gradlew && ./gradlew assembleDebug
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Create GitHub Release with APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          files: android/app/build/outputs/apk/debug/app-debug.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
